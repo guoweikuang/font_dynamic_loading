@@ -105,9 +105,122 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 ---
 
+#### Q3: 为什么 TCP 是可靠传输，还需要应用层 ACK？
+
+**答：**
+
+**TCP 可靠性的局限：**
+1. **TCP 只保证数据到达对方，但不保证应用层处理成功**
+   - 服务端收到消息后，数据库写入失败
+   - 消息处理过程中服务崩溃
+   - 进程被 OOM Kill
+
+2. **TCP ACK 只确认到达，不确认业务处理**
+   ```mermaid
+   sequenceDiagram
+       Client->>Server: 发送消息(msg_001)
+       Server->>DB: 写入数据库
+       DB-->>Server: 写入失败
+       Server-->>Client: TCP ACK (仅确认收到)
+       Note over Server,Client: 消息丢失！客户端以为发送成功
+   ```
+
+3. **网络分层导致的"成功"假象**
+   - TCP 三次握手成功
+   - 应用层处理失败
+   - 客户端收到 ACK，但实际未处理
+
+**应用层 ACK 的必要性：**
+- 确认业务处理完成
+- 支持重试机制
+- 实现消息可靠投递
+
+---
+
+#### Q4: HTTP/2 和 WebSocket 在长连接场景下如何选择？
+
+**答：**
+
+**HTTP/2 特性：**
+- 多路复用：单一 TCP 连接上并行多个请求
+- 头部压缩：HPACK 算法
+- 服务端推送
+- 流控制
+
+**WebSocket 特性：**
+- 全双工通讯
+- 自定义协议
+- 实时性强
+
+**选择建议：**
+
+| 场景 | 推荐方案 |
+|------|----------|
+| 纯服务端推送（通知） | HTTP/2 Server Push |
+| 双向实时通讯 | WebSocket |
+| 需要 REST 兼容性 | HTTP/2 + SSE |
+| 低延迟游戏/IM | WebSocket |
+| API + 实时更新混合 | HTTP/2 多路复用 |
+
+**Golang HTTP/2 示例：**
+```go
+// HTTP/2 服务端推送
+func handler(w http.ResponseWriter, r *http.Request) {
+    pusher, ok := w.(http.Pusher)
+    if ok {
+        // 推送静态资源
+        pusher.Push("/static/app.js", nil)
+    }
+    // 正常处理
+}
+```
+
+---
+
+#### Q5: 什么是半双工和全双工？WebSocket 是如何实现全双工的？
+
+**答：**
+
+**概念定义：**
+- **半双工**：同一时刻只能一方发送数据（对讲机）
+- **全双工**：双方可以同时发送数据（电话）
+
+**HTTP/1.1 困境：**
+- 请求-响应模式
+- 必须等响应返回才能发下一个请求
+- 即使 pipelining 也无法真正并行
+
+**WebSocket 全双工实现：**
+```go
+// 读写分离的两个 goroutine
+func (c *Client) readPump() {
+    for {
+        _, msg, err := c.conn.ReadMessage()
+        if err != nil {
+            break
+        }
+        // 处理读取
+    }
+}
+
+func (c *Client) writePump() {
+    for {
+        msg := <-c.sendChan
+        // 处理写入
+        err := c.conn.WriteMessage(websocket.TextMessage, msg)
+    }
+}
+
+// 启动两个 goroutine
+go c.readPump()
+go c.writePump()
+```
+
+---
+
 ### 4.2 Golang 并发模型类
 
-#### Q3: Golang 的 GMP 模型是什么？请详细解释
+#### Q6: Golang 的 GMP 模型是什么？请详细解释
 
 **答：**
 
@@ -137,7 +250,7 @@ graph LR
 
 ---
 
-#### Q4: Go 中 channel 的实现原理是什么？无缓冲 channel 和有缓冲 channel 有什么区别？
+#### Q7: Go 中 channel 的实现原理是什么？无缓冲 channel 和有缓冲 channel 有什么区别？
 
 **答：**
 
@@ -174,7 +287,7 @@ func main() {
 
 ---
 
-#### Q5: Go 中 race condition 是什么？如何检测和避免？
+#### Q8: Go 中 race condition 是什么？如何检测和避免？
 
 **答：**
 
@@ -216,9 +329,250 @@ func (c *Counter) Get() int {
 
 ---
 
+#### Q9: Go 的调度器如何处理阻塞的 Goroutine？
+
+**答：**
+
+**阻塞类型及处理：**
+
+| 阻塞类型 | 示例 | Go 调度器处理 |
+|---------|------|--------------|
+| I/O 阻塞 | 网络读写 | 网络轮询器接管，不阻塞 M |
+| 系统调用 | 文件读写 | M 进入阻塞，P 绑定新 M |
+| Channel 阻塞 | <-ch | G 放入等待队列，M 继续执行其他 G |
+| Mutex 阻塞 | mu.Lock() | G 放入等待队列，M 继续执行 |
+| Sleep | time.Sleep() | G 放入定时器，M 继续执行 |
+
+**关键设计：**
+```go
+// 网络 I/O 不阻塞 M 的原理
+func main() {
+    // Go 运行时会调用 netpoll/epoll
+    // 阻塞的 G 会被放到网络轮询器
+    // M 可以继续执行其他 G
+    resp, err := http.Get("https://example.com")
+}
+```
+
+---
+
+#### Q10: 什么是协程泄漏？如何排查和避免？
+
+**答：**
+
+**协程泄漏场景：**
+1. **Channel 泄漏**：发送方或接收方阻塞
+   ```go
+   func leak() {
+       ch := make(chan int)
+       go func() {
+           ch <- 1 // 永远没有人接收
+       }()
+       // 函数返回，goroutine 泄漏
+   }
+   ```
+
+2. **互斥锁未释放**
+   ```go
+   func leak() {
+       mu.Lock()
+       return // 忘记 Unlock，goroutine 会一直等待
+   }
+   ```
+
+3. **Defer 死循环**
+   ```go
+   func leak() {
+       for {
+           // 缺少退出条件
+       }
+   }
+   ```
+
+**排查方法：**
+```go
+// 1. pprof 查看 goroutine 数量
+import "runtime/pprof"
+
+func main() {
+    // 定期打印 goroutine 数量
+    for {
+        time.Sleep(5 * time.Second)
+        fmt.Println("Goroutines:", runtime.NumGoroutine())
+    }
+}
+
+// 2. pprof heap 分析
+go tool pprof http://localhost:6060/debug/pprof/goroutine
+```
+
+**避免策略：**
+- 使用 context 超时
+- Channel 设置缓冲并配合 select + default
+- 资源使用 defer 释放
+- 合理使用 worker pool
+
+---
+
+#### Q11: sync.Map 适合什么场景？为什么比 map + mutex 慢？
+
+**答：**
+
+**sync.Map 适用场景：**
+1. 读多写少的并发场景
+2. key 是一次写入，多次读取
+3. 不知道 key 数量
+
+**不适合场景：**
+- 写多读少
+- 需要对 map 进行完全遍历
+
+**性能对比：**
+```go
+// 普通 map + mutex
+type SafeMap struct {
+    mu sync.RWMutex
+    m  map[string]int
+}
+
+// sync.Map 内部实现更复杂，有额外开销
+// 在低并发下，mutex 方案更快
+```
+
+**sync.Map 内部原理：**
+```go
+// 简化理解
+type Map struct {
+    mu sync.RWMutex
+    read atomic.Value // readOnly
+    dirty map[string]interface{}
+    misses int
+}
+```
+- read 字段用 atomic 实现无锁读
+- 写入时加锁，更新 dirty
+- 一定次数的 miss 后，提升 dirty 为 read
+
+---
+
+#### Q12: Go 的 GC 是如何工作的？什么情况会导致 GC 变慢？
+
+**答：**
+
+**GC 工作原理（三色标记清除）：**
+```mermaid
+graph TD
+    A[所有对象白色] --> B[GC 开始：所有对象标记为灰色]
+    B --> C[灰色对象扫描]
+    C --> D{还有灰色对象?}
+    D -->|是| E[灰色对象引用的白色对象变灰色]
+    D -->|否| F[清除白色对象]
+    E --> C
+```
+
+**GC 阶段：**
+1. **Mark Start**：STW，扫描根对象
+2. **Mark**：并发标记
+3. **Mark Termination**：STW，完成标记
+4. **Sweep**：并发清除
+5. **GC Percent**：根据内存增长触发
+
+**导致 GC 慢的原因：**
+1. **对象分配过快**
+   - 大量小对象分配
+   - 内存增长率超过 GC 回收速度
+
+2. **指针引用复杂**
+   - 大量跨代引用
+   - 扫描时间长
+
+3. **STW 时间过长**
+   - Mark Termination 阶段
+   - 内存过大
+
+**优化方法：**
+```go
+// 1. 减少对象分配
+// 预先分配
+buf := make([]byte, 0, 1024)
+
+// 2. 使用 sync.Pool
+var bufferPool = sync.Pool{
+    New: func() interface{} {
+        return new(bytes.Buffer)
+    },
+}
+
+// 3. 避免内存逃逸
+// 尽量在栈上分配，避免返回指针
+```
+
+---
+
+#### Q13: 详细解释 Go 的内存逃逸分析
+
+**答：**
+
+**逃逸场景：**
+```go
+func escape1() *int {
+    x := 1
+    return &x // x 逃逸到堆
+}
+
+func escape2() int {
+    x := 1
+    return x // x 在栈上
+}
+
+func escape3() []int {
+    s := []int{1, 2, 3}
+    return s // s 逃逸到堆
+}
+
+func escape4(s []int) {
+    fmt.Println(s) // s 逃逸，因为 fmt.Println 参数可能是 interface{}
+}
+```
+
+**逃逸规则：**
+- 返回局部变量指针 → 逃逸
+- 发送指针/channel 到 channel → 逃逸
+- slice/Map/Channel 动态增长 → 可能逃逸
+- interface 类型参数 → 可能逃逸
+
+**查看逃逸：**
+```bash
+go build -gcflags '-m -m' main.go
+```
+
+**避免逃逸：**
+```go
+// 不好：返回指针，逃逸到堆
+func process() *Result {
+    r := &Result{}
+    return r
+}
+
+// 好：使用值返回
+func process() Result {
+    r := Result{}
+    return r
+}
+
+// 使用 sync.Pool
+var pool = sync.Pool{
+    New: func() interface{} {
+        return &Buffer{}
+    },
+}
+```
+
+---
+
 ### 4.3 长连接实现类
 
-#### Q6: 如何设计一个高性能的 WebSocket 服务器？请详细说明
+#### Q14: 如何设计一个高性能的 WebSocket 服务器？请详细说明
 
 **答：**
 
@@ -313,7 +667,7 @@ func (c *Client) writePump() {
 
 ---
 
-#### Q7: 如何处理 WebSocket 连接的断线重连和消息可靠性？
+#### Q15: 如何处理 WebSocket 连接的断线重连和消息可靠性？
 
 **答：**
 
@@ -396,7 +750,7 @@ go func() {
 
 ---
 
-#### Q8: 如何设计心跳检测机制？请说明保活和心跳的区别
+#### Q16: 如何设计心跳检测机制？请说明保活和心跳的区别
 
 **答：**
 
@@ -443,9 +797,200 @@ func (c *Client) startHeartbeat(cfg HeartbeatConfig) {
 
 ---
 
+#### Q17: WebSocket 断线如何快速感知？有哪些方案？
+
+**答：**
+
+**方案对比：**
+
+| 方案 | 优点 | 缺点 |
+|------|------|------|
+| 应用层心跳 | 灵活、可携带业务数据 | 需要代码实现 |
+| TCP KeepAlive | 操作系统原生 | 默认时间太长 |
+| TCP 快速探测 | 可自定义超时 | 需要配置 |
+| 读写超时 | 简单直接 | 可能误判 |
+
+**最佳实践组合：**
+```go
+type Connection struct {
+    conn         *websocket.Conn
+    readTimeout  time.Duration
+    writeTimeout time.Duration
+}
+
+func (c *Connection) ReadMessage() (int, []byte, error) {
+    // 设置读超时
+    c.conn.SetReadDeadline(time.Now().Add(c.readTimeout))
+    return c.conn.ReadMessage()
+}
+
+// 组合方案
+func (c *Client) monitor() {
+    // 1. 读写超时检测断线
+    // 2. 定期应用层心跳确认存活
+    // 3. TCP KeepAlive 作为最后防线
+}
+```
+
+---
+
+#### Q18: 如何处理 WebSocket 消息积压问题？
+
+**答：**
+
+**问题场景：**
+- 客户端网络慢
+- 发送方速度 > 接收方处理速度
+- Channel 缓冲区爆满
+
+**解决方案：**
+
+1. **Channel 丢弃策略**
+```go
+select {
+case c.send <- msg:
+default:
+    // 缓冲区满，丢弃最旧消息
+    select {
+    case <-c.send:
+        c.send <- msg
+    default:
+        // 消息太新，丢弃
+    }
+}
+```
+
+2. **发送窗口机制**
+```go
+type Sender struct {
+    pending    map[string]*Message
+    windowSize int
+    acked      chan string
+}
+
+func (s *Sender) Send(msg *Message) error {
+    if len(s.pending) >= s.windowSize {
+        return errors.New("window full")
+    }
+    s.pending[msg.ID] = msg
+    return nil
+}
+```
+
+3. **背压处理**
+```go
+// 让发送方感知处理速度
+type BackPressure struct {
+    send    chan []byte
+    recvAck chan int // 接收方反馈处理速度
+}
+
+func (s *Sender) adjustRate() {
+    rate := <-s.recvAck
+    if rate < 10 {
+        s.interval *= 2 // 降速
+    }
+}
+```
+
+---
+
+#### Q19: 如何设计 WebSocket 协议帧？消息分片如何处理？
+
+**答：**
+
+**WebSocket 帧格式：**
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-------+-+-------------+-------------------------------+
+|F|R|R|R| opcode|M| Payload len |    Extended payload length    |
+|I|S|S|S|  (4)  |A|     (7)     |             (16/64)           |
+|N|V|V|V|       |S|             |   (if payload len==126/127)   |
+| |1|2|3|       |K|             |                               |
++-+---------------+---------------+ - - - - - - - - - - - - - - +
+|     Extended payload length continued, if payload len==127  |
++ - - - - - - - - - - - - - - - - - - - - - - - +-------------+
+|                               | Masking-key, if MASK set to 1 |
++-------------------------------+-------------------------------+
+|    Masking-key (continued)    |          Payload Data         |
++-------------------------------- - - - - - - - - - - - - - - - +
+:                     Payload Data continued ...                :
++ - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - +
+|                     Payload Data continued ...                |
++---------------------------------------------------------------+
+```
+
+**消息分片示例：**
+```go
+type FragmentedMessage struct {
+    fin         bool
+    opcode      int
+    messageID   string
+    fragments   [][]byte
+}
+
+func handleFragment(msg websocket.Message) *FragmentedMessage {
+    if msg.FIN {
+        return &FragmentedMessage{
+            fin:       true,
+            opcode:    msg.Opcode,
+            messageID: msg.MessageID,
+            fragments: [][]byte{msg.Payload},
+        }
+    }
+    
+    // 收集分片
+    return collectFragment(msg)
+}
+```
+
+---
+
+#### Q20: 如何设计消息的压缩传输？
+
+**答：**
+
+**压缩方案选择：**
+
+| 方案 | 压缩率 | CPU 消耗 | 适用场景 |
+|------|--------|----------|----------|
+| gzip | 高 | 中 | 文本消息 |
+| snappy | 中 | 低 | 实时性要求高 |
+| lz4 | 中 | 低 | 高速传输 |
+| zstd | 高 | 中高 | 平衡场景 |
+
+**WebSocket 压缩扩展：**
+```go
+// 启用 per-message deflate 扩展
+config := websocket.Config{
+    Compression: websocketCompression,
+}
+
+upgrader := websocket.Upgrader{
+    EnableCompression: true,
+}
+```
+
+**自定义压缩：**
+```go
+func compressMessage(data []byte) ([]byte, error) {
+    var buf bytes.Buffer
+    w, _ := zlib.NewWriterLevel(&buf, zlib.BestCompression)
+    _, err := w.Write(data)
+    if err != nil {
+        return nil, err
+    }
+    w.Close()
+    return buf.Bytes(), nil
+}
+```
+
+---
+
 ### 4.4 IM 消息类
 
-#### Q9: IM 系统中消息如何存储和检索？请设计消息表结构
+#### Q21: IM 系统中消息如何存储和检索？请设计消息表结构
 
 **答：**
 
@@ -499,7 +1044,7 @@ func QueryMessages(roomID int64, cursor int64, limit int) ([]Message, int64) {
 
 ---
 
-#### Q10: 消息的顺序性如何保证？
+#### Q22: 消息的顺序性如何保证？
 
 **答：**
 
@@ -532,7 +1077,7 @@ func (r *Room) SendMessage(msg *Message) {
 
 ---
 
-#### Q11: 如何实现已读回执和未读计数？
+#### Q23: 如何实现已读回执和未读计数？
 
 **答：**
 
@@ -580,9 +1125,209 @@ func GetUnreadCount(userID int64) UnreadCount {
 
 ---
 
+#### Q24: 消息 ID 如何设计？分布式 ID 生成方案有哪些？
+
+**答：**
+
+**常见方案对比：**
+
+| 方案 | 优点 | 缺点 | 适用场景 |
+|------|------|------|----------|
+| UUID | 无需中心、简单 | 无序、占用空间大 | 客户端生成 |
+| 数据库自增 | 有序、简单 | 单点瓶颈 | 单库 |
+| Snowflake | 有序、高性能 | 依赖时钟 | 分布式 |
+| Leaf | 高可用、趋势递增 | 复杂 | 大规模 |
+
+**Snowflake 算法：**
+```go
+type Snowflake struct {
+    mu        sync.Mutex
+    timestamp int64
+    workerID  int64
+    sequence  int64
+}
+
+func (s *Snowflake) NextID() int64 {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    
+    now := time.Now().UnixMilli()
+    if now == s.timestamp {
+        s.sequence++
+        if s.sequence > 4095 {
+            // 等待下一毫秒
+            for now <= s.timestamp {
+                now = time.Now().UnixMilli()
+            }
+        }
+    } else {
+        s.sequence = 0
+    }
+    s.timestamp = now
+    
+    // 组装 ID
+    id := (now-1609459200000) << 22   // 时间戳
+    id |= s.workerID << 12             // 工作机器ID
+    id |= s.sequence                   // 序列号
+    return id
+}
+```
+
+---
+
+#### Q25: 消息撤回和消息删除有什么区别？如何实现？
+
+**答：**
+
+**概念区分：**
+- **撤回**：发送方撤回，消息对双方都不可见
+- **删除**：接收方删除，只对当前用户不可见
+
+**撤回实现：**
+```go
+type RecallMessage struct {
+    OriginalMsgID  string    // 被撤回的消息ID
+    RecallTime     int64
+    RecallUserID   int64
+}
+
+// 撤回逻辑
+func RecallMessage(msg RecallMessage) error {
+    // 1. 更新原消息状态
+    db.Model(&Message{}).
+        Where("id = ?", msg.OriginalMsgID).
+        Updates(map[string]interface{}{
+            "is_recalled":  true,
+            "recall_time":  msg.RecallTime,
+            "recall_user":  msg.RecallUserID,
+        })
+    
+    // 2. 通知接收方
+    notifyUser(msg.ReceiverID, &Notification{
+        Type:    "message_recalled",
+        MsgID:   msg.OriginalMsgID,
+    })
+    
+    return nil
+}
+```
+
+**逻辑删除 vs 物理删除：**
+```go
+// 推荐逻辑删除
+type Message struct {
+    IsDeleted bool `gorm:"default:false"`
+}
+
+// 查询时过滤
+func QueryMessages() []Message {
+    return db.Where("is_deleted = ?", false).Find(&messages)
+}
+```
+
+---
+
+#### Q26: 消息的草稿功能如何设计？
+
+**答：**
+
+**草稿存储：**
+```go
+type Draft struct {
+    UserID     int64
+    RoomID     int64
+    Content    string
+    UpdatedAt  int64
+}
+
+// 保存草稿（每次输入时保存）
+func SaveDraft(userID, roomID int64, content string) {
+    key := fmt.Sprintf("draft:%d:%d", userID, roomID)
+    redis.Set(key, content, 24*time.Hour)
+}
+
+// 获取草稿
+func GetDraft(userID, roomID int64) string {
+    key := fmt.Sprintf("draft:%d:%d", userID, roomID)
+    return redis.Get(key)
+}
+
+// 发送消息时删除草稿
+func SendMessage(userID, roomID int64, content string) {
+    // 发送逻辑...
+    // 删除草稿
+    key := fmt.Sprintf("draft:%d:%d", userID, roomID)
+    redis.Del(key)
+}
+```
+
+**注意事项：**
+- 草稿不需要持久化到数据库，Redis 即可
+- 设置过期时间（如 24 小时）
+- 发送消息成功后立即清理
+
+---
+
+#### Q27: 如何实现@mention 功能？@所有人如何处理性能？
+
+**答：**
+
+**@功能实现：**
+```go
+type Mention struct {
+    Type      string  // "user" 或 "all"
+    UserIDs   []int64
+    MessageID int64
+}
+
+// 解析消息中的 @ 提及
+func ParseMentions(content string) *Mention {
+    mention := &Mention{
+        Type:    "user",
+        UserIDs: []int64{},
+    }
+    
+    // 正则匹配 @user 或 @所有人
+    re := regexp.MustCompile(`@(\d+|所有人)`)
+    matches := re.FindAllStringSubmatch(content, -1)
+    
+    for _, m := range matches {
+        if m[1] == "所有人" {
+            mention.Type = "all"
+            break
+        }
+        userID, _ := strconv.ParseInt(m[1], 10, 64)
+        mention.UserIDs = append(mention.UserIDs, userID)
+    }
+    
+    return mention
+}
+
+// @所有人 性能优化
+func BroadcastToAll(roomID int64, msg *Message) {
+    // 1. 先写入消息表
+    db.Create(msg)
+    
+    // 2. 异步推送，不阻塞主流程
+    go func() {
+        members := getRoomMembers(roomID)
+        
+        // 分批推送，避免瞬间冲击
+        batches := splitBatch(members, 100)
+        for _, batch := range batches {
+            for _, member := range batch {
+                pushToUser(member.ID, msg)
+            }
+        }
+    }()
+}
+```
+
+---
+
 ### 4.5 在线文档类
 
-#### Q12: 在线文档协作如何实现实时同步？请说明 OT/CRDT 算法
+#### Q28: 在线文档协作如何实现实时同步？请说明 OT/CRDT 算法
 
 **答：**
 
@@ -648,7 +1393,7 @@ func (c *TextCRDT) Update(value string, siteID int64) {
 
 ---
 
-#### Q13: 如何处理文档冲突和版本管理？
+#### Q29: 如何处理文档冲突和版本管理？
 
 **答：**
 
@@ -686,9 +1431,268 @@ func (d *Document) GetVersion(v int64) (Document, error) {
 
 ---
 
+#### Q30: 详细解释 OT 算法的 transform 规则
+
+**答：**
+
+**基本 transform 函数：**
+```go
+// T(T(op1, op2), op3) = T(op1, T(op2, op3))
+
+// Insert vs Insert
+func transformInsertInsert(op1, op2 *Operation) (newOp1, newOp2 *Operation) {
+    if op1.Pos < op2.Pos || (op1.Pos == op2.Pos && op1.ID < op2.ID) {
+        newOp1 = op1
+        newOp2 = &Operation{
+            Type:    "insert",
+            Pos:     op2.Pos + len(op2.Content),
+            Content: op2.Content,
+        }
+    } else {
+        newOp1 = &Operation{
+            Type:    "insert",
+            Pos:     op1.Pos + len(op1.Content),
+            Content: op1.Content,
+        }
+        newOp2 = op2
+    }
+    return
+}
+
+// Insert vs Delete
+func transformInsertDelete(op1, op2 *Operation) (newOp1, newOp2 *Operation) {
+    newOp1 = op1
+    if op1.Pos <= op2.Pos {
+        newOp2 = &Operation{
+            Type:   "delete",
+            Pos:    op2.Pos + len(op2.Content),
+        }
+    } else if op1.Pos >= op2.Pos+op2.Length {
+        newOp2 = &Operation{
+            Type:   "delete",
+            Pos:    op2.Pos,
+        }
+    } else {
+        // 插入位置在删除范围内
+        newOp2 = &Operation{
+            Type:   "delete",
+            Pos:    op2.Pos,
+        }
+    }
+    return
+}
+
+// Delete vs Delete
+func transformDeleteDelete(op1, op2 *Operation) (newOp1, newOp2 *Operation) {
+    // 复杂的重叠处理...
+    return
+}
+```
+
+**OT 存在的问题：**
+- 转换函数可能产生不一致
+- 服务器需要维护操作历史
+- 复杂场景下可能失败
+
+---
+
+#### Q31: CRDT 与 OT 相比有什么优缺点？
+
+**答：**
+
+**CRDT 优点：**
+1. **无需中心协调**：各副本独立处理
+2. **最终一致性**：保证收敛
+3. **无冲突**：不需要转换函数
+4. **更适合分布式**
+
+**CRDT 缺点：**
+1. **内存开销大**：需要存储操作历史
+2. **压缩复杂**：需要 GC
+3. **非直觉**：与直觉编辑顺序不同
+
+**OT vs CRDT 对比：**
+
+| 特性 | OT | CRDT |
+|------|-----|------|
+| 复杂度 | 转换函数复杂 | 数据结构复杂 |
+| 内存 | 较小 | 较大 |
+| 延迟 | 需要服务器参与 | 可本地先处理 |
+| 一致性 | 强一致 | 最终一致 |
+| 适用 | 文本编辑 | 任意数据类型 |
+
+**实际应用：**
+- Google Docs：OT（Jupiter 算法）
+- Figma：CRDT（Yjs）
+- 腾讯文档：混合方案
+
+---
+
+#### Q32: Yjs 是如何实现 CRDT 的？
+
+**答：**
+
+**Yjs 核心概念：**
+```go
+// Yjs 文档
+type YDoc struct {
+    structs  map[string]Struct  // ID -> 结构
+    updates  []Update           // 待同步更新
+}
+
+// Yjs 使用 Y.Text 处理文本
+type YText struct {
+    doc *YDoc
+}
+
+// 文本被表示为一系列 Insert/Delete 操作
+type Item struct {
+    ID        ID
+    Content   string
+    Deleted   bool
+    Left      *Item
+    Right     *Item
+}
+```
+
+**关键算法：**
+```go
+// 1. 本地操作
+func (t *YText) Insert(pos int, text string) {
+    item := &Item{
+        ID:      generateID(),
+        Content: text,
+    }
+    t.doc.InsertItem(item)
+}
+
+// 2. 远程更新合并
+func (t *YDoc) MergeUpdate(update Update) {
+    // 增量更新，不需要完全重建
+    for _, item := range update.Items {
+        if !t.hasNewer(item.ID) {
+            t.applyInsert(item)
+        }
+    }
+}
+
+// 3. GC（垃圾回收）
+func (t *YDoc) GC() {
+    // 删除被完全覆盖的 Items
+}
+```
+
+---
+
+#### Q33: 在线文档如何实现光标同步？
+
+**答：**
+
+**光标数据结构：**
+```go
+type Cursor struct {
+    ClientID  int64
+    Position  int      // 字符位置
+    Selection *Selection // 可选：选区
+    Color     string
+    Name      string
+}
+
+// 选区结构
+type Selection struct {
+    Start int
+    End   int
+}
+```
+
+**光标同步流程：**
+```go
+// 1. 本地光标移动
+func (c *Awareness) UpdateLocalCursor(pos int) {
+    c.LocalCursor.Position = pos
+    c.Broadcast()
+}
+
+// 2. 广播光标位置
+func (c *Awareness) Broadcast() {
+    update := &AwarenessUpdate{
+        ClientID: c.clientID,
+        Cursor:   c.LocalCursor,
+        State:    c.LocalState,
+    }
+    broadcastToRoom(update)
+}
+
+// 3. 远程光标渲染
+func (c *RemoteCursorManager) HandleUpdate(update *AwarenessUpdate) {
+    cursor := &RemoteCursor{
+        Position:  update.Cursor.Position,
+        Color:     update.Cursor.Color,
+        Name:      update.Cursor.Name,
+    }
+    c.cursors[update.ClientID] = cursor
+    c.render()
+}
+```
+
+**注意事项：**
+- 光标位置需要与 OT/CRDT 操作同步
+- 远程光标需要加锁图标
+- 选区需要区分谁在操作
+
+---
+
+#### Q34: 文档的权限控制如何设计？
+
+**答：**
+
+**权限模型：**
+```go
+type Permission struct {
+    UserID     int64
+    DocumentID int64
+    Level      PermissionLevel
+}
+
+type PermissionLevel int
+const (
+    PermissionNone PermissionLevel = iota
+    PermissionRead
+    PermissionComment
+    PermissionWrite
+    PermissionAdmin
+)
+
+// 权限检查
+func CheckPermission(userID, docID int64, required PermissionLevel) bool {
+    perm := getPermission(userID, docID)
+    return perm.Level >= required
+}
+```
+
+**权限继承：**
+```go
+type Document struct {
+    ID          int64
+    ParentID    int64  // 父文档，用于继承权限
+    InheritPerm bool   // 是否继承父文档权限
+}
+
+// 获取有效权限
+func GetEffectivePermission(userID, docID int64) Permission {
+    doc := getDocument(docID)
+    if doc.InheritPerm && doc.ParentID != 0 {
+        return GetEffectivePermission(userID, doc.ParentID)
+    }
+    return getPermission(userID, docID)
+}
+```
+
+---
+
 ### 4.6 分布式架构类
 
-#### Q14: 如何设计一个支持万人同时在线的 IM 系统？
+#### Q35: 如何设计一个支持万人同时在线的 IM 系统？
 
 **答：**
 
@@ -740,7 +1744,7 @@ graph TB
 
 ---
 
-#### Q15: 如何保证消息不丢包？
+#### Q36: 如何保证消息不丢包？
 
 **答：**
 
@@ -783,7 +1787,7 @@ func (s *Sender) handleTimeout(msgID string) {
 
 ---
 
-#### Q16: 分布式环境下如何实现消息路由？
+#### Q37: 分布式环境下如何实现消息路由？
 
 **答：**
 
@@ -826,9 +1830,213 @@ func (g *Gateway) subscribe() {
 
 ---
 
+#### Q38: 分布式在线状态如何实现？
+
+**答：**
+
+**方案对比：**
+
+| 方案 | 优点 | 缺点 |
+|------|------|------|
+| Redis 集中存储 | 简单、一致性好 | 单点/性能瓶颈 |
+| Gossip 协议 | 无中心、去中心化 | 最终一致、有延迟 |
+| Redis Cluster | 高可用 | 复杂度高 |
+
+**Redis 实现：**
+```go
+// 上线
+func UserOnline(userID int64, gatewayID string) {
+    key := fmt.Sprintf("online:%d", userID)
+    pipe := redis.Pipeline()
+    pipe.Set(key, gatewayID, 30*time.Second)  // 30秒超时
+    pipe.SAdd("online_users", userID)
+    pipe.Exec()
+}
+
+// 下线
+func UserOffline(userID int64) {
+    key := fmt.Sprintf("online:%d", userID)
+    redis.Del(key)
+    redis.SRem("online_users", userID)
+}
+
+// 查询在线状态
+func IsOnline(userID int64) (bool, string) {
+    key := fmt.Sprintf("online:%d", userID)
+    gatewayID, err := redis.Get(key).Result()
+    if err != nil {
+        return false, ""
+    }
+    return true, gatewayID
+}
+
+// 心跳保活
+func KeepAlive(userID int64) {
+    key := fmt.Sprintf("online:%d", userID)
+    redis.Expire(key, 30*time.Second)
+}
+```
+
+**Gossip 方案（Consul/Serf）：**
+- 适合超大规模
+- 有一定的延迟
+- 实现复杂
+
+---
+
+#### Q39: 如何设计消息的多端同步？
+
+**答：**
+
+**多端同步模型：**
+```go
+type Device struct {
+    DeviceID   string
+    UserID     int64
+    LastSeqID  int64    // 最后收到的消息序列号
+    Online     bool
+}
+
+type SyncManager struct {
+    devices map[string]*Device  // deviceID -> Device
+}
+
+// 同步消息
+func (s *SyncManager) SyncMessage(msg *Message, excludeDeviceID string) {
+    // 发送给所有在线设备
+    for _, device := range s.devices {
+        if device.DeviceID == excludeDeviceID {
+            continue
+        }
+        
+        if device.Online {
+            // 在线设备直接发送
+            pushToDevice(device, msg)
+        } else {
+            // 离线设备，存入离线消息
+            storeOfflineMessage(device.UserID, device.DeviceID, msg)
+        }
+    }
+}
+
+// 设备登录时同步离线消息
+func (s *SyncManager) SyncOfflineMessages(device *Device) []Message {
+    messages := getOfflineMessages(device.UserID, device.DeviceID, device.LastSeqID)
+    
+    // 更新设备序列号
+    if len(messages) > 0 {
+        device.LastSeqID = messages[len(messages)-1].ID
+    }
+    
+    return messages
+}
+```
+
+**同步策略：**
+- 增量同步：根据 LastSeqID 拉取
+- 全量同步：首次登录或序列号丢失
+- 离线合并：多条离线消息合并推送
+
+---
+
+#### Q40: 消息推送的投递策略有哪些？
+
+**答：**
+
+**推送方式：**
+```go
+type PushStrategy interface {
+    Push(msg *Message, userID int64)
+}
+
+// 1. 在线即时推送
+type OnlinePush struct{}
+
+func (p *OnlinePush) Push(msg *Message, userID int64) {
+    gatewayID := getGateway(userID)
+    if gatewayID != "" {
+        pushToGateway(gatewayID, msg)
+    }
+}
+
+// 2. 离线存储
+type OfflinePush struct{}
+
+func (p *OfflinePush) Push(msg *Message, userID int64) {
+    storeOfflineMessage(userID, msg)
+}
+
+// 3. 混合推送
+type HybridPush struct {
+    onlinePush   PushStrategy
+    offlinePush  PushStrategy
+}
+
+func (p *HybridPush) Push(msg *Message, userID int64) {
+    if isOnline(userID) {
+        p.onlinePush.Push(msg, userID)
+    } else {
+        p.offlinePush.Push(msg, userID)
+    }
+}
+```
+
+**推送优先级：**
+1. WebSocket 长连接（最高优先级）
+2. App 进程存活 → 消息推送
+3. App 进程死亡 → 系统通知
+
+---
+
+#### Q41: 消息漫游是什么？如何实现？
+
+**答：**
+
+**概念：**
+- 消息漫游：用户在任何设备上都能查看完整的历史消息
+- 不依赖本地存储，云端同步
+
+**实现方案：**
+```go
+type MessageArchive struct {
+    UserID     int64
+    Messages   []Message  // 用户的双向消息
+    LastSyncAt int64
+}
+
+// 全量同步
+func FullSync(userID int64, deviceID string) *MessageArchive {
+    // 从消息表查询用户所有会话的最新消息
+    // 需要分页加载，避免内存爆炸
+    
+    var messages []Message
+    page := 0
+    for {
+        batch := fetchMessages(userID, page, 100)
+        messages = append(messages, batch...)
+        if len(batch) < 100 {
+            break
+        }
+        page++
+    }
+    
+    return &MessageArchive{
+        UserID:   userID,
+        Messages: messages,
+    }
+}
+
+// 增量同步
+func IncrementalSync(userID int64, deviceID string, lastSyncTime int64) []Message {
+    return fetchMessagesAfter(userID, lastSyncTime)
+}
+```
+
+---
+
 ### 4.7 性能优化类
 
-#### Q17: Go 服务如何进行性能调优？
+#### Q42: Go 服务如何进行性能调优？
 
 **答：**
 
@@ -894,7 +2102,7 @@ func putMessage(m *Message) {
 
 ---
 
-#### Q18: 如何处理高并发下的热点问题？
+#### Q43: 如何处理高并发下的热点问题？
 
 **答：**
 
@@ -956,9 +2164,143 @@ func (r *RateLimiter) Allow() bool {
 
 ---
 
+#### Q44: 消息量亿级情况下，如何优化数据库查询？
+
+**答：**
+
+**分库分表策略：**
+```go
+// 按 roomID 分片
+func GetDBKey(roomID int64) string {
+    shard := roomID % 100
+    return fmt.Sprintf("messages_%02d", shard)
+}
+
+// 消息表结构优化
+type Message struct {
+    ID        int64 `gorm:"primaryKey"`
+    RoomID    int64 `gorm:"index"`
+    SenderID  int64 `gorm:"index"`
+    Content   string
+    CreatedAt int64
+    // 复合索引
+}
+
+// 索引设计原则：
+// 1. 查询频率高的字段加索引
+// 2. 避免过多索引（影响写入）
+// 3. 覆盖索引避免回表
+```
+
+**读写分离：**
+```go
+// 主库写入
+func WriteMessage(msg *Message) error {
+    return db.Master().Create(msg).Error
+}
+
+// 从库读取
+func ReadMessages(roomID int64, limit int) []Message {
+    return db.Slave().Where("room_id = ?", roomID).Limit(limit).Find()
+}
+```
+
+**异步写入：**
+```go
+// 消息写入 MQ，异步持久化
+func AsyncSaveMessage(msg *Message) {
+    msgQueue <- msg
+}
+
+func MessageWorker() {
+    for msg := range msgQueue {
+        // 批量写入
+        batch := collectMessages(100)
+        db.Master().CreateInBatches(batch, 100)
+    }
+}
+```
+
+---
+
+#### Q45: 如何评估系统的并发能力？
+
+**答：**
+
+**性能指标：**
+```go
+type Metrics struct {
+    QPS           int     // 每秒查询数
+    LatencyP50    int64   // 50% 请求延迟（毫秒）
+    LatencyP99    int64   // 99% 请求延迟
+    ErrorRate     float64 // 错误率
+    ActiveConns   int     // 活跃连接数
+}
+```
+
+**压测工具：**
+```bash
+# wrk
+wrk -t12 -c400 -d30s http://localhost:8080/ws
+
+# vegeta
+echo "GET http://localhost:8080/ws" | vegeta attack -rate=1000 -duration=30s
+
+# go-wrk
+go-wrk -n 10000 -c 100 http://localhost:8080/ws
+```
+
+**压测指标监控：**
+```bash
+# 系统指标
+top
+vmstat 1
+iostat -x 1
+
+# Go 指标
+go tool pprof http://localhost:6060/debug/pprof/heap
+
+# 数据库指标
+show processlist;
+show status like 'Questions';
+```
+
+---
+
+#### Q46: 长连接服务如何进行容量规划？
+
+**答：**
+
+**容量评估模型：**
+```
+单机容量 = (CPU 核心数 × 每核心承载连接数)
+每核心承载连接数 ≈ 10000 (WebSocket)
+```
+
+**评估步骤：**
+1. **计算总连接数**
+   - 日活用户 DAU × 在线率 × 多端系数
+   - 例如：1000万 DAU × 30% 在线率 × 1.5 端 = 450万连接
+
+2. **计算 Gateway 数量**
+   - 单机容量：8核 × 8000 = 6.4万连接
+   - 450万 / 6.4万 = 70 台
+
+3. **计算消息处理能力**
+   - 假设平均消息 100 字节
+   - 消息处理耗时 1ms
+   - 单机 QPS = 1000
+
+**冗余设计：**
+- 预留 30% 冗余
+- 考虑峰值流量（是平均的 3-5 倍）
+- 考虑故障转移
+
+---
+
 ### 4.8 安全类
 
-#### Q19: WebSocket 安全方面需要注意什么？
+#### Q47: WebSocket 安全方面需要注意什么？
 
 **答：**
 
@@ -1003,7 +2345,7 @@ upgrader.ReadLimit = 1024 * 1024 // 1MB
 
 ---
 
-#### Q20: 如何防止 XSS 和恶意消息攻击？
+#### Q48: 如何防止 XSS 和恶意消息攻击？
 
 **答：**
 
@@ -1055,14 +2397,163 @@ func (f *DFAFilter) Filter(text string) string {
 
 ---
 
+#### Q49: 限流算法有哪些？滑动窗口和固定窗口有什么区别？
+
+**答：**
+
+**限流算法对比：**
+
+| 算法 | 优点 | 缺点 | 适用场景 |
+|------|------|------|----------|
+| 固定窗口 | 简单 | 边界突变 | 简单限流 |
+| 滑动窗口 | 精确 | 实现复杂 | 精确限流 |
+| 令牌桶 | 允许突发 | 需要定时器 | API 限流 |
+| 漏桶 | 流量平滑 | 不允许突发 | 流量整形 |
+
+**固定窗口实现：**
+```go
+type FixedWindowLimiter struct {
+    limit    int
+    window   time.Duration
+    counter  int64
+    lastReset time.Time
+    mu       sync.Mutex
+}
+
+func (l *FixedWindowLimiter) Allow() bool {
+    l.mu.Lock()
+    defer l.mu.Unlock()
+    
+    now := time.Now()
+    if now.Sub(l.lastReset) > l.window {
+        l.counter = 0
+        l.lastReset = now
+    }
+    
+    if l.counter >= int64(l.limit) {
+        return false
+    }
+    l.counter++
+    return true
+}
+```
+
+**滑动窗口实现：**
+```go
+type SlidingWindowLimiter struct {
+    limit     int
+    window    time.Duration
+    requests  []time.Time
+    mu        sync.Mutex
+}
+
+func (l *SlidingWindowLimiter) Allow() bool {
+    l.mu.Lock()
+    defer l.mu.Unlock()
+    
+    now := time.Now()
+    cutoff := now.Add(-l.window)
+    
+    // 移除过期的请求
+    var valid []time.Time
+    for _, t := range l.requests {
+        if t.After(cutoff) {
+            valid = append(valid, t)
+        }
+    }
+    l.requests = valid
+    
+    if len(l.requests) >= l.limit {
+        return false
+    }
+    l.requests = append(l.requests, now)
+    return true
+}
+```
+
+**边界突变问题：**
+```
+固定窗口：在 1:59 限流 100，2:00 立刻又能限流 100
+滑动窗口：更平滑的限流
+```
+
+---
+
+#### Q50: 如何防止 DDoS 攻击？
+
+**答：**
+
+**多层防御策略：**
+
+1. **网络层**
+```nginx
+# Nginx 配置
+limit_req_zone $binary_remote_addr zone=limit:10m rate=100r/s;
+limit_conn_zone $binary_remote_addr zone=conn:10m;
+
+server {
+    limit_req zone=limit burst=200 nodelay;
+    limit_conn conn 50;
+}
+```
+
+2. **应用层**
+```go
+// IP 限流
+type IPLimiter struct {
+    ips    map[string]*RateLimiter
+    limit  int
+    window time.Duration
+}
+
+func (l *IPLimiter) Allow(ip string) bool {
+    limiter, ok := l.ips[ip]
+    if !ok {
+        limiter = NewRateLimiter(l.limit, l.window)
+        l.ips[ip] = limiter
+    }
+    return limiter.Allow()
+}
+
+// 异常检测
+func (s *ThreatDetector) Detect(ip string) bool {
+    // 1. 请求频率异常
+    // 2. 大量错误请求
+    // 3. 异常时间段访问
+    return s.score(ip) > threshold
+}
+```
+
+3. **基础设施**
+- CDN 隐藏源站
+- DDoS 高防服务
+- 弹性扩容
+
+---
+
 ## 5 总结
 
-以上涵盖了 Golang 长连接系统的核心技术点和面试高频问题。候选人需要重点掌握：
+以上涵盖了 Golang 长连接系统的 **50 道面试高频提问及详细答案**，每个章节都进行了深度扩展。
 
-1. **Golang 基础**：GMP 模型、channel、并发安全
-2. **WebSocket**：连接管理、消息处理、心跳检测
-3. **IM 核心**：消息存储、顺序保证、未读计数
-4. **在线文档**：OT/CRDT 算法、实时同步
-5. **分布式**：水平扩展、消息路由、高可用
-6. **性能优化**：GC 调优、内存管理、热点处理
+### 面试重点分布
+
+| 章节 | 问题数量 | 重点程度 |
+|------|----------|----------|
+| 基础概念 | 5题 | ★★★ |
+| Golang 并发 | 8题 | ★★★★ |
+| 长连接实现 | 7题 | ★★★★ |
+| IM 消息 | 7题 | ★★★ |
+| 在线文档 | 6题 | ★★★ |
+| 分布式架构 | 7题 | ★★★★ |
+| 性能优化 | 5题 | ★★★ |
+| 安全 | 4题 | ★★★ |
+
+### 候选人需重点掌握
+
+1. **Golang 基础**：GMP 模型、channel、GC、内存逃逸、并发安全
+2. **WebSocket**：连接管理、消息处理、心跳检测、协议帧
+3. **IM 核心**：消息存储、顺序保证、未读计数、ID 生成
+4. **在线文档**：OT/CRDT 算法、光标同步、权限控制
+5. **分布式**：水平扩展、消息路由、在线状态、多端同步
+6. **性能优化**：GC 调优、内存管理、热点处理、容量规划
 7. **安全**：认证、限流、防攻击
